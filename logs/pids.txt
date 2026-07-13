@@ -1,1 +1,0 @@
-# OpenOBD — vom Fahrzeug unterstuetzte Service-01-PIDs

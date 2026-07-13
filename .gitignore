@@ -11,3 +11,5 @@
 
 # Aufgezeichnete Fahrdaten (nicht ins Repo)
 *.csv
+logs/
+docs/

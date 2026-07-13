@@ -1,1 +1,0 @@
-# OpenOBD — Anfrage-ID 0x18DB33F1 @ 500k — unterstuetzte Service-01-PIDs
