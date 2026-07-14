@@ -29,19 +29,25 @@
 #define CFG_DISCOVERY       true            // beim Boot PID-Discovery fahren
 #define CFG_LED             false            // Status-LED (Platzhalter)
 
-// --- WLAN --------------------------------------------------------------------
-// "ap"   = eigener Hotspot (Handy verbindet sich damit, kein Internet am Handy)
-// "join" = ins Auto-WLAN einwählen (Handy behält Internet, Zeit per NTP, openobd.local)
-#define CFG_WIFI_MODE     "ap"
-#define CFG_WIFI_SSID     ""                // nur bei "join": SSID des Auto-Hotspots
-#define CFG_WIFI_PASS     ""                // nur bei "join": Passwort
-#define CFG_FALLBACK_AP   true             // "join" gescheitert -> eigenen AP aufmachen
-#define CFG_AP_SSID       "OpenOBD"
-#define CFG_AP_PASS       "openobd1234"     // mind. 8 Zeichen
+// --- WLAN (nur kurz fuer NTP-Zeit, dann AUS — kein Webserver/Hotspot) ---
+// "join" = beim Boot bekannte WLANs durchprobieren (nimmt das staerkste verfuegbare),
+//          NTP-Zeit holen, dann WLAN aus.   "off" = gar kein WLAN, nur BLE.
+#define CFG_WIFI_MODE     "join"
+// Bis zu 4 bekannte Netze. Leer ("") = ignoriert. Reihenfolge egal (staerkstes gewinnt).
+// Tipp: Auto-eSIM-Hotspot + iPhone-Hotspot + Zuhause eintragen -> unterwegs immer Zeit.
+#define CFG_WIFI_1_SSID   ""
+#define CFG_WIFI_1_PASS   ""
+#define CFG_WIFI_2_SSID   ""
+#define CFG_WIFI_2_PASS   ""
+#define CFG_WIFI_3_SSID   ""
+#define CFG_WIFI_3_PASS   ""
+#define CFG_WIFI_4_SSID   ""
+#define CFG_WIFI_4_PASS   ""
 
-// --- Zeit --------------------------------------------------------------------
+// --- Zeit (automatische Sommer-/Winterzeit via POSIX-TZ) ---------------------
 #define CFG_NTP           "pool.ntp.org"
-#define CFG_TZ_MIN        60               // lokaler Offset in Minuten (CET=60, CEST=120)
+// Deutschland: "CET-1CEST,M3.5.0,M10.5.0/3"  |  Tuerkei: "<+03>-3"  |  UTC: "UTC0"
+#define CFG_TZ            "CET-1CEST,M3.5.0,M10.5.0/3"
 
 // --- Dev-Streaming (nur relevant im Dev-Modus) -------------------------------
 #define CFG_TCP_PORT      3333             // Roh-Frames als SavvyCAN-Zeilen (nc/Python)

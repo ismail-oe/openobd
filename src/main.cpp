@@ -23,8 +23,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>     // openobd.local, wenn wir im Auto-WLAN haengen
+#include <NimBLEDevice.h> // BLE-Broadcast (Status + Werte) statt Webserver
+#include <esp_system.h>  // esp_restart() fuer den Software-Watchdog
 #include <SD.h>
 #include <LittleFS.h>
 #include <SPI.h>
@@ -61,13 +61,8 @@ struct Config {
   int  logIntervalMs = CFG_LOG_INTERVAL_MS;
   bool discovery     = CFG_DISCOVERY;
   char wifiMode[6]   = CFG_WIFI_MODE;
-  char ssid[33]      = CFG_WIFI_SSID;
-  char pass[65]      = CFG_WIFI_PASS;
-  bool fallbackAp    = CFG_FALLBACK_AP;
-  char apSsid[33]    = CFG_AP_SSID;
-  char apPass[65]    = CFG_AP_PASS;
   char ntp[48]       = CFG_NTP;
-  int  tzMin         = CFG_TZ_MIN;
+  char tz[40]        = CFG_TZ;
   bool streamTcp     = CFG_STREAM_TCP;
   int  tcpPort       = CFG_TCP_PORT;
   bool mqttEn        = CFG_MQTT;
@@ -76,8 +71,8 @@ struct Config {
   char mqttTopic[40] = CFG_MQTT_TOPIC;
 } cfg;
 
-WebServer server(80);
 SemaphoreHandle_t fsMutex;
+volatile uint32_t lastLoopTick = 0;   // Software-Watchdog: loop() stempelt hier, wdtTask prueft
 
 // Storage-Abstraktion — SD bevorzugt, LittleFS als Fallback
 FS* storage = nullptr;
@@ -156,15 +151,15 @@ bool isObdResponse(const twai_message_t &rx) {
 bool timeSynced = false;
 long long anchorEpochMs = 0;       // reale Zeit (UTC, ms) zum Ankerzeitpunkt
 unsigned long anchorUptimeMs = 0;  // millis() zum Ankerzeitpunkt
-int tzOffsetMin = 0;               // lokaler Offset (Minuten oestlich UTC), vom Handy
+// Lokalzeit kommt aus der POSIX-TZ (cfg.tz) via setenv("TZ")+localtime_r -> autom. Sommer-/Winterzeit
 char anchorFile[40];
 long long lastKnownEpochMs = 0;   // letzte bekannte Echtzeit (aus /lasttime.txt) — Ordner-Datierung ohne RTC
 
 long long nowEpochMs() { return timeSynced ? anchorEpochMs + (long long)(millis() - anchorUptimeMs) : 0; }
 
 void localNow(struct tm &t) {
-  time_t local = (time_t)(nowEpochMs() / 1000) + (time_t)tzOffsetMin * 60;
-  gmtime_r(&local, &t);
+  time_t utc = (time_t)(nowEpochMs() / 1000);
+  localtime_r(&utc, &t);   // wendet die per setenv("TZ") gesetzte Zone inkl. DST an
 }
 
 void clockString(char* buf, size_t n) {
@@ -179,7 +174,7 @@ void writeTimeAnchor() {  // Sidecar zur aktuellen Session
   if (!storage || anchorFile[0] == 0) return;
   if (xSemaphoreTake(fsMutex, pdMS_TO_TICKS(50))) {
     File f = storage->open(anchorFile, "w");
-    if (f) { f.printf("uptime_ms=%lu\nepoch_ms=%lld\ntz_min=%d\n", anchorUptimeMs, anchorEpochMs, tzOffsetMin); f.close(); }
+    if (f) { f.printf("uptime_ms=%lu\nepoch_ms=%lld\n", anchorUptimeMs, anchorEpochMs); f.close(); }
     xSemaphoreGive(fsMutex);
   }
 }
@@ -253,7 +248,6 @@ uint32_t obdReqId = 0x7DF;                     // OBD-Anfrageadresse: 0x7DF funk
 uint8_t  obdPad = 0x00;                        // Fuellbyte fuer Bytes 3-7 (manche VAG-STG wollen 0x55)
 int      canBitrateK = 500;                    // aktive Bitrate in kbit/s (500 Standard, 250 Alternative)
 volatile bool probeRequested = false;          // Auto-Probe vom Webserver angefordert, loop() fuehrt aus
-char probeReport[2000] = "Noch kein Auto-Probe gelaufen.\nAm Auto (Motor an): Button druecken.";
 const char* CSV_HEADER = "Timestamp_ms,RPM,Speed_kmh,Coolant_C,OilTemp_C,MAP_kPa,IAT_C,Load_pct,TimingAdv_deg,Throttle_pct,AccelPedal_pct,CmdThrottle_pct,DemandTorque_pct,ActualTorque_pct,STFT_pct,LTFT_pct,Baro_kPa,O2S2_V,O2S2_STFT_pct,CmdEquivRatio,CatalystTemp_C,O2_SecLTFT_pct,FuelLevel_pct,FuelRate_Lph,ModuleVoltage_V,AmbientTemp_C,RefTorque_Nm,O2S1_Lambda,O2S1_Current_mA,AbsLoad_pct,EvapPurge_pct,TotalDist_km,TotalFuel_L,Throttle11_pct,RelThrottle_pct,RunTime_s,DistSinceClear_km,FuelType,EvapPress_kPa,Odometer_km,Gear";
 const char* RAW_HEADER = "Time Stamp,ID,Extended,Dir,Bus,LEN,D1,D2,D3,D4,D5,D6,D7,D8";  // SavvyCAN
 
@@ -299,8 +293,8 @@ void ensureDirTree(const char* full) {
 void currentYM(char* buf, size_t n) {
   long long e = timeSynced ? nowEpochMs() : lastKnownEpochMs;
   if (e <= 0) { strlcpy(buf, "unsorted", n); return; }
-  time_t t = (time_t)(e / 1000) + (time_t)tzOffsetMin * 60;
-  struct tm tmv; gmtime_r(&t, &tmv);
+  time_t t = (time_t)(e / 1000);
+  struct tm tmv; localtime_r(&t, &tmv);   // lokale Zeit inkl. DST
   snprintf(buf, n, "%04d/%02d", tmv.tm_year + 1900, tmv.tm_mon + 1);
 }
 
@@ -309,7 +303,7 @@ void saveLastTime() {
   if (!storage || !timeSynced) return;
   if (xSemaphoreTake(fsMutex, pdMS_TO_TICKS(50))) {
     File f = storage->open("/lasttime.txt", "w");
-    if (f) { f.printf("epoch_ms=%lld\ntz_min=%d\n", nowEpochMs(), tzOffsetMin); f.close(); }
+    if (f) { f.printf("epoch_ms=%lld\n", nowEpochMs()); f.close(); }
     xSemaphoreGive(fsMutex);
   }
 }
@@ -321,7 +315,6 @@ void loadLastTime() {
       while (f.available()) {
         String line = f.readStringUntil('\n');
         if (line.startsWith("epoch_ms=")) lastKnownEpochMs = atoll(line.substring(9).c_str());
-        else if (line.startsWith("tz_min=")) tzOffsetMin = line.substring(7).toInt();
       }
       f.close();
     }
@@ -417,9 +410,6 @@ void logRawLine(uint32_t id, bool ext, uint8_t dlc, const uint8_t* data, bool tx
   if (rawLen >= RAW_FLUSH_BYTES) flushRaw();
 }
 
-void webServerTask(void *parameter) {
-  for (;;) { server.handleClient(); vTaskDelay(1); }
-}
 
 // ---- Dev-Streaming: Roh-Frames drahtlos (TCP-Zeilen fuer Python/SavvyCAN-Capture, optional MQTT).
 // Nur opt-in (config dev.*). loop() (Core 1) fuellt eine Queue, DIESER Task (Core 0) sendet -> keine
@@ -465,652 +455,25 @@ void writePidsFile();
 void captureFrame(twai_message_t &rx);
 bool queryPidMask(uint8_t basePid, uint32_t &mask);
 
-// Dashboard-SPA: feste Vollbild-Ansicht (kein Scrollen), Kategorie-Tabs, Gauges,
-// Live-Graph, Landscape-optimiert. Technik/Discovery liegt im Dev-Tab. Statisch aus
-// PROGMEM (spart RAM); alle Werte kommen live von /data.
-void handleRoot() {
-  if (!cfg.webUi) {   // Dev-Modus: kein Cockpit, nur Technik-Links
-    server.send(200, "text/html",
-      "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-      "<body style='font-family:sans-serif;background:#0f1020;color:#eee;padding:22px'>"
-      "<h2>OpenOBD &mdash; Dev-Modus</h2>"
-      "<p style='color:#aaa'>Dashboard deaktiviert (Dev-Modus geflasht, <code>config.h</code>). "
-      "Roh-Mitschnitt + Diagnose laufen.</p>"
-      "<p><a href='/explore' style='color:#8ad'>CAN Explorer</a> &middot; "
-      "<a href='/uds' style='color:#8ad'>UDS</a> &middot; "
-      "<a href='/sessions' style='color:#8ad'>Sessions</a> &middot; "
-      "<a href='/pids' style='color:#8ad'>PIDs</a> &middot; "
-      "<a href='/log' style='color:#8ad'>Log</a></p></body></html>");
-    return;
-  }
-  static const char PAGE[] PROGMEM = R"PAGE(<!doctype html><html lang=de><head>
-<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>OpenOBD</title><style>
-:root{--bg:#0a0e17;--pan:#121826;--pan2:#0d1320;--line:#1d2635;--ink:#eaf0f8;--mut:#7f8ba1;--faint:#4a5568;--acc:#31d2e6;--good:#37c98a;--warn:#f2b13d;--crit:#f0566c}
-*{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
-html,body{height:100%}
-body{background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,sans-serif;overflow:hidden}
-#app{display:flex;flex-direction:column;height:100dvh;padding:8px 10px;gap:8px}
-#top{display:flex;align-items:center;gap:10px}
-.ham{font-size:19px;line-height:1;background:var(--pan);border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:9px 13px;font-weight:700}
-#top b{font-size:14px;letter-spacing:.5px}#top b i{color:var(--acc);font-style:normal}
-#cur{font-size:13px;font-weight:700;color:var(--acc)}
-#clk{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--mut);font-size:12px}
-#stt{font-size:11px;font-weight:700}
-#menu{position:fixed;inset:0;background:rgba(6,9,15,.975);z-index:30;display:none;padding:16px;grid-template-columns:repeat(3,1fr);gap:12px;align-content:center}
-#menu.open{display:grid}
-.mbtn{background:linear-gradient(180deg,var(--pan),var(--pan2));border:1px solid var(--line);border-radius:18px;display:flex;align-items:center;justify-content:center;min-height:86px;font-size:20px;font-weight:700;color:var(--ink)}
-.mbtn.on{background:var(--acc);color:#081018;border-color:transparent}
-#view{flex:1;min-height:0;display:grid;gap:8px}
-#view.cat{grid-template-columns:repeat(4,1fr);grid-auto-rows:1fr}
-#view.status{display:block;overflow-y:auto}
-.strows{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.technik{margin-top:8px;display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.technik h4{grid-column:1/-1;margin:8px 2px 0;font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--mut);font-weight:700}
-.lk{display:flex;align-items:center;justify-content:center;text-align:center;text-decoration:none;background:var(--pan);border:1px solid var(--line);color:var(--acc);border-radius:10px;padding:12px;font-size:13px;font-weight:600}
-.lk.act{color:var(--good)}
-#view.liveview{display:block}
-.tile{background:linear-gradient(180deg,var(--pan),var(--pan2));border:1px solid var(--line);border-radius:13px;padding:9px 12px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
-.tl{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--mut);display:flex;justify-content:space-between;align-items:center;gap:6px}
-.tag{font-size:9px;font-weight:800;color:var(--acc);background:#0e2830;padding:2px 6px;border-radius:8px;letter-spacing:.3px;text-transform:none;flex:none}
-.tv{font-weight:700;font-variant-numeric:tabular-nums;font-size:clamp(17px,4.4vh,32px);line-height:1.05;margin-top:2px;font-family:ui-monospace,Menlo,monospace}
-.tu{font-size:.42em;color:var(--mut);font-weight:600;margin-left:3px}
-.bar{height:5px;border-radius:3px;background:var(--line);margin-top:auto;overflow:hidden}
-.bar>i{display:block;height:100%;width:0;background:var(--acc);border-radius:3px;transition:width .4s,background .4s}
-.wide{grid-column:1/-1}
-.live-wrap{display:grid;grid-template-rows:1.15fr .9fr .85fr;gap:8px;height:100%;min-height:0}
-.live-top{display:grid;grid-template-columns:1fr 1fr;gap:8px;min-height:0}
-.live-tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;min-height:0}
-canvas{flex:1;min-height:0;width:100%}
-.g{align-items:center;justify-content:center;position:relative}
-.g svg{width:100%;height:auto;max-height:84%}
-.g .ab{fill:none;stroke:var(--line);stroke-width:11;stroke-linecap:round}
-.g .av{fill:none;stroke:var(--acc);stroke-width:11;stroke-linecap:round;transition:stroke-dashoffset .5s}
-.g .rd{position:absolute;top:50%;left:0;right:0;text-align:center}
-.g .rd .n{font:700 clamp(22px,6vh,46px)/1 ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
-.g .rd .u{font-size:11px;color:var(--mut);margin-left:4px}
-.g .cap{position:absolute;top:9px;left:12px;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--mut)}
-.srow{display:flex;align-items:center;gap:10px;padding:11px 13px;background:var(--pan);border:1px solid var(--line);border-radius:11px}
-.srow .dt{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none}
-.srow .k{color:var(--mut);font-size:12px;font-weight:600;width:38%}
-.srow .sv{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:var(--ink)}
-@media(orientation:portrait){
- #view.cat{grid-template-columns:repeat(2,1fr)}
- .strows{grid-template-columns:1fr}
- .technik{grid-template-columns:repeat(2,1fr)}
- #menu{grid-template-columns:repeat(2,1fr)}
- .live-tiles{grid-template-columns:repeat(3,1fr)}
- .live-wrap{grid-template-rows:1fr 1fr 1.1fr}
-}
-</style></head><body><div id=app>
-<div id=top><button class="ham" id="ham">&#9776;</button><b>Open<i>OBD</i></b><span id="cur">Live</span><span id="clk">--</span><span id="stt">--</span></div>
-<div id="menu"></div><div id="view"></div></div>
-<script>
-// key:[Label,Einheit,BalkenMax,Kennzeichen?]  (Kennzeichen: 'jetzt'=Momentan, 'Ø'=Durchschnitt)
-const M={
- rpm:['Drehzahl','1/min',7000],spd:['Tempo','km/h',200],
- tmp:['Kuehlmittel','°C',120],oil:['Oeltemp','°C',150],iat:['Ansaugluft','°C',80],
- map:['Saugrohr','kPa',250],boost:['Ladedruck','kPa',150],baro:['Luftdruck','kPa',110],
- load:['Last','%',100],absld:['Abs-Last','%',100],tmg:['Zuendung','°',64],
- thr:['Drossel','%',100],cthr:['Soll-Drossel','%',100],pdl:['Gaspedal','%',100],
- atq:['Ist-Moment','%',100],dtq:['Soll-Moment','%',100],rtq:['Ref-Moment','Nm',400],ps:['Leistung','PS',200],
- frate:['Verbrauch','L/h',30,'jetzt'],l100:['Verbrauch','L/100',20,'jetzt'],avg100:['Verbrauch','L/100',20,'Ø'],
- fused:['Sprit','L',0,'Trip'],dist:['Strecke','km',0,'Trip'],fuel:['Tank','%',100],
- o2lam:['Lambda','',2],o2cur:['O2-Strom','mA',20],o2s2v:['O2-Sonde 2','V',1.5],o2s2t:['O2-2 Trim','%',25],
- ceq:['Soll-Lambda','',2],stft:['Kurz-Trim','%',25],ltft:['Lang-Trim','%',25],o2slt:['Sek-LTFT','%',25],
- cat:['Kat-Temp','°C',900],evap:['Evap','%',100],
- mvolt:['Bordspannung','V',16],amb:['Aussentemp','°C',50],
- odo:['Kilometerstand','km',0,'gesamt'],distclr:['Strecke ges.','km',0,'Trip'],runtime:['Laufzeit','s',0],
- thr11:['Drosselklappe','%',100],relthr:['Rel. Drossel','%',100],evappr:['Evap-Druck','kPa',0],
- gear:['Gang','',0]
-};
-const CATS={
- Motor:['rpm','tmp','oil','iat','map','boost','load','absld','tmg'],
- Fahrt:['spd','gear','thr11','relthr','thr','cthr','pdl','atq','dtq','rtq','ps','runtime'],
- Verbrauch:['l100','avg100','frate','fused','dist','odo','distclr','fuel'],
- Abgas:['o2lam','o2cur','o2s2v','o2s2t','ceq','stft','ltft','o2slt','cat','evap','evappr'],
- Elektrik:['mvolt','amb','baro']
-};
-const LIVE=['l100','avg100','ps','tmp','boost','mvolt'];
-const ZONE={tmp:[80,106],oil:[70,120],mvolt:[13.2,15.0],l100:[0,6],avg100:[0,6]};
-// Technik-Sektion im Status-Tab (einmal gebaut, damit Taps nicht verloren gehen)
-const TECHNIK='<div class="technik"><h4>Ansehen</h4>'+
- '<a class="lk" href="/sessions">Sessions</a><a class="lk" href="/explore">CAN-Explorer</a>'+
- '<a class="lk" href="/uds">UDS-Scan</a><a class="lk" href="/pids">PIDs</a>'+
- '<a class="lk" href="/timeouts">PID-Status</a><a class="lk" href="/log">Log</a>'+
- '<h4>Aktionen</h4>'+
- '<a class="lk act" href="#" onclick="return act(\'/api/rediscover\',this,\'Discovery neu\')">Discovery neu</a>'+
- '<a class="lk act" href="#" onclick="return act(\'/api/record?cmd=new\',this,\'Neue Session\')">Neue Session</a>'+
- '<a class="lk act" href="#" onclick="return act(\'/api/record?cmd=toggle\',this,\'Rec An/Aus\')">Rec An/Aus</a>'+
- '<a class="lk act" href="#" onclick="return act(\'/api/canmode\',this,\'CAN Normal/Lausch\')">CAN Normal/Lausch</a>'+
- '<a class="lk act" href="#" onclick="return probe(this)">Auto-Probe</a></div>';
-function act(u,el,name){fetch(u).catch(function(){});el.textContent='✓';setTimeout(function(){el.textContent=name;},900);return false;}
-function probe(el){fetch('/api/probe').catch(function(){});el.textContent='laeuft ~20s…';setTimeout(function(){location.href='/probereport';},22000);return false;}
-function zcol(k,v){var z=ZONE[k];if(!z||isNaN(v))return'var(--acc)';
- if(v>=z[0]&&v<=z[1])return'var(--good)';var p=(z[1]-z[0])*0.18;
- return(v>=z[0]-p&&v<=z[1]+p)?'var(--warn)':'var(--crit)';}
-const TABS=['Live'].concat(Object.keys(CATS)).concat(['Status']);
-let cur='Live',hist={rpm:[],spd:[],load:[]};
-const view=document.getElementById('view'),menu=document.getElementById('menu'),ham=document.getElementById('ham'),curEl=document.getElementById('cur');
-ham.onclick=function(){menu.innerHTML=TABS.map(function(n){return '<button class="mbtn'+(n===cur?' on':'')+'" data-t="'+n+'">'+n+'</button>';}).join('');menu.classList.add('open');};
-menu.onclick=function(e){var b=e.target.closest?e.target.closest('.mbtn'):null;if(!b){menu.classList.remove('open');return;}
- cur=b.dataset.t;curEl.textContent=cur;menu.classList.remove('open');render();};
-function tile(k){var m=M[k];var tag=m[3]?'<span class="tag">'+m[3]+'</span>':'';
- return '<div class="tile" data-k="'+k+'"><div class="tl"><span>'+m[0]+'</span>'+tag+'</div>'+
- '<div class="tv"><span class="n">--</span><span class="tu">'+m[1]+'</span></div>'+
- (m[2]?'<div class="bar"><i></i></div>':'')+'</div>';}
-function gaugeHTML(k,max){return '<div class="tile g" data-g="'+k+'" data-max="'+max+'">'+
- '<div class="cap">'+M[k][0]+'</div>'+
- '<svg viewBox="0 0 200 112"><path class="ab" d="M16,100 A84,84 0 0,1 184,100"/>'+
- '<path class="av" d="M16,100 A84,84 0 0,1 184,100"/></svg>'+
- '<div class="rd"><span class="n">--</span><span class="u">'+M[k][1]+'</span></div></div>';}
-function render(){
- view.className='';
- if(cur==='Live'){view.classList.add('liveview');
-  view.innerHTML='<div class="live-wrap"><div class="live-top">'+gaugeHTML('spd',200)+gaugeHTML('rpm',7000)+'</div>'+
-   '<div class="tile wide"><div class="tl"><span>Verlauf &mdash; Drehzahl · Tempo · Last</span></div><canvas id="gc"></canvas></div>'+
-   '<div class="live-tiles">'+LIVE.map(tile).join('')+'</div></div>';
- }else if(cur==='Status'){view.classList.add('status');view.innerHTML='<div class="strows" id="strows"><div class="tl">wird geladen&hellip;</div></div>'+TECHNIK;}
- else{view.classList.add('cat');view.innerHTML=CATS[cur].map(tile).join('');}
-}
-function updateGauge(g,val,max){var av=g.querySelector('.av');if(!av._len)av._len=av.getTotalLength();
- var f=isNaN(val)?0:Math.max(0,Math.min(1,val/max));
- av.style.strokeDasharray=av._len;av.style.strokeDashoffset=av._len*(1-f);
- g.querySelector('.n').textContent=isNaN(val)?'--':Math.round(val);}
-function drawGraph(){var c=document.getElementById('gc');if(!c||!c.clientWidth)return;
- var w=c.width=c.clientWidth,h=c.height=c.clientHeight,x=c.getContext('2d');x.clearRect(0,0,w,h);
- var ln=function(a,mx,col){if(a.length<2)return;x.strokeStyle=col;x.lineWidth=2;x.beginPath();
-  a.forEach(function(v,i){var px=i/(a.length-1)*w,py=h-Math.min(1,Math.max(0,v/mx))*(h-6)-3;i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();};
- ln(hist.rpm,7000,'#f0566c');ln(hist.spd,200,'#31d2e6');ln(hist.load,100,'#37c98a');}
-function drawStatus(d){var on='var(--good)',off='var(--warn)';
- var row=function(k,val,ok){return '<div class="srow"><span class="dt" style="background:'+(ok?on:off)+'"></span>'+
-  '<span class="k">'+k+'</span><span class="sv">'+val+'</span></div>';};
- var el=document.getElementById('strows'); if(!el)return;
- el.innerHTML=
-  row('WLAN',d.wmode==='join'?('Auto-WLAN · '+d.ip):('Hotspot · '+d.ip),d.wmode==='join')+
-  row('Internet',d.net?'verbunden':'offline',d.net)+
-  row('Zeit',(d.clock||'--')+(d.synced?'':' (nicht sync)'),d.synced)+
-  row('Speicher',d.sdtype==='-'?'keiner':(d.sdtype+' · '+d.sdfree+' / '+d.sdtot+' MB frei'),d.sdtype!=='-')+
-  row('Aufnahme',(d.rec?'laeuft':'pausiert')+' · Session '+d.sess,d.rec)+
-  row('CAN-Bus',d.canlive?('live · '+d.canmode+' · RX '+d.canrx):'keine Daten',d.canlive)+
-  row('Firmware',d.fw||'-',true);
-}
-function update(d){
- // Handy-Zeit-Sync (Fallback ohne NTP): solange das Board nicht synct, Zeit schicken
- if(d.synced===false){fetch('/api/settime?epoch='+Date.now()+'&tz='+(-new Date().getTimezoneOffset())).catch(function(){});}
- document.getElementById('clk').textContent=d.clock||'--';
- var s=document.getElementById('stt');
- s.textContent=(d.sdtype&&d.sdtype!=='-'?d.sdtype:'kein SD')+' · '+(d.canlive?'CAN ✓':'CAN ✗');
- s.style.color=d.canlive?'var(--good)':'var(--warn)';
- [].forEach.call(document.querySelectorAll('.tile[data-k]'),function(t){var k=t.dataset.k,val=d[k];
-  t.querySelector('.n').textContent=(val===undefined||val==='--')?'--':val;
-  var bi=t.querySelector('.bar>i');if(bi){var num=parseFloat(val),mx=M[k][2];
-   bi.style.width=(isNaN(num)?0:Math.max(0,Math.min(100,Math.abs(num)/mx*100)))+'%';
-   bi.style.background=zcol(k,num);}});
- [].forEach.call(document.querySelectorAll('.g[data-g]'),function(g){updateGauge(g,parseFloat(d[g.dataset.g]),+g.dataset.max);});
- ['rpm','spd','load'].forEach(function(k){var n=parseFloat(d[k]);if(!isNaN(n)){hist[k].push(n);if(hist[k].length>90)hist[k].shift();}});
- if(cur==='Live')drawGraph();
- if(cur==='Status')drawStatus(d);
-}
-render();
-setInterval(function(){fetch('/data').then(function(r){return r.json();}).then(update).catch(function(){});},1000);
-</script></body></html>)PAGE";
-  server.send_P(200, "text/html", PAGE);
-}
 
-void handleData() {
-  // Wert erst zeigen, wenn der zugehoerige PID wirklich geantwortet hat -> sonst "--".
-  auto v = [](uint8_t pid, String val) { return pidSeen[pid] ? val : String("\"--\""); };
-  String j; j.reserve(1400); j = "{";
-  // --- Motor ---
-  j += "\"rpm\":"    + v(0x0C, String(rpm));
-  j += ",\"spd\":"   + v(0x0D, String(speed_kmh));
-  j += ",\"tmp\":"   + v(0x05, String(coolant_temp));
-  j += ",\"oil\":"   + v(0x5C, String(oil_temp));
-  j += ",\"iat\":"   + v(0x0F, String(intake_temp));
-  j += ",\"map\":"   + v(0x0B, String(manifold_kpa));
-  j += ",\"baro\":"  + v(0x33, String(baro_kpa));
-  j += ",\"load\":"  + v(0x04, String(engine_load));
-  j += ",\"absld\":" + v(0x43, String(absolute_load, 1));
-  j += ",\"tmg\":"   + v(0x0E, String(timing_advance, 1));
-  // --- Fahrt ---
-  j += ",\"thr\":"   + v(0x47, String(throttle_pos));
-  j += ",\"cthr\":"  + v(0x4C, String(cmd_throttle));
-  j += ",\"pdl\":"   + v(0x5A, String(accel_pedal));
-  j += ",\"dtq\":"   + v(0x61, String(demand_torque));
-  j += ",\"atq\":"   + v(0x62, String(actual_torque));
-  j += ",\"rtq\":"   + v(0x63, String(ref_torque));
-  // --- Verbrauch ---
-  j += ",\"frate\":" + v(0x5E, String(fuel_rate, 1));
-  j += ",\"fuel\":"  + v(0x2F, String(fuel_level));
-  j += ",\"dist\":"  + String(totalDistKm, 2);
-  j += ",\"fused\":" + String(totalFuelL, 2);
-  // --- Abgas / Umwelt ---
-  j += ",\"o2lam\":" + v(0x34, String(o2s1_lambda, 3));
-  j += ",\"o2cur\":" + v(0x34, String(o2s1_current, 1));
-  j += ",\"o2s2v\":" + v(0x15, String(o2_s2_voltage, 3));
-  j += ",\"o2s2t\":" + v(0x15, String(o2_s2_stft, 1));
-  j += ",\"ceq\":"   + v(0x44, String(cmd_equiv_ratio, 3));
-  j += ",\"stft\":"  + v(0x06, String(short_fuel_trim, 1));
-  j += ",\"ltft\":"  + v(0x07, String(long_fuel_trim, 1));
-  j += ",\"o2slt\":" + v(0x56, String(o2_secondary_ltft, 1));
-  j += ",\"cat\":"   + v(0x3C, String(catalyst_temp));
-  j += ",\"evap\":"  + v(0x2E, String(evap_purge));
-  j += ",\"amb\":"   + v(0x46, String(ambient_temp));
-  // --- Elektrik ---
-  j += ",\"mvolt\":" + v(0x42, String(module_voltage, 2));
-  // --- Harvest-Neuzugaenge ---
-  j += ",\"thr11\":"   + v(0x11, String(throttle11));
-  j += ",\"relthr\":"  + v(0x45, String(rel_throttle));
-  j += ",\"runtime\":" + v(0x1F, String(runtime_s));
-  j += ",\"distclr\":" + v(0x31, String(dist_clr));
-  j += ",\"evappr\":"  + v(0x53, String(evap_press, 2));
-  j += ",\"odo\":"     + v(0xA6, String(odometer_km, 1));
-  j += ",\"fueltype\":"+ v(0x51, String(fuel_type));
-  if (pidSeen[0xA4]) j += ",\"gear\":\"" + (gear > 0 ? String(gear) : String("N")) + "\"";
-  else               j += ",\"gear\":\"--\"";
-  // --- Abgeleitet: Momentanverbrauch L/100km, Ladedruck ueber Umgebung, geschaetzte Leistung ---
-  String l100 = "\"--\"";
-  if (pidSeen[0x5E] && pidSeen[0x0D] && speed_kmh > 3) l100 = String(fuel_rate / speed_kmh * 100.0, 1);
-  j += ",\"l100\":" + l100;
-  String avg100 = "\"--\"";   // Trip-Durchschnitt aus aufsummierter Strecke/Sprit
-  if (totalDistKm > 0.1) avg100 = String(totalFuelL / totalDistKm * 100.0, 1);
-  j += ",\"avg100\":" + avg100;
-  String boost = "\"--\"";
-  if (pidSeen[0x0B] && pidSeen[0x33]) boost = String(manifold_kpa - baro_kpa);
-  j += ",\"boost\":" + boost;
-  String ps = "\"--\"";
-  if (pidSeen[0x62] && pidSeen[0x63] && pidSeen[0x0C]) {
-    float nm = ref_torque * actual_torque / 100.0f;      // Ist-Moment in Nm (Anteil vom Ref-Moment)
-    ps = String(nm * rpm / 9549.0f * 1.35962f, 0);       // P[kW] -> PS
-  }
-  j += ",\"ps\":" + ps;
-  // --- System / Status ---
-  char clk[40]; clockString(clk, sizeof(clk));
-  bool joined = (WiFi.status() == WL_CONNECTED);
-  IPAddress ip = joined ? WiFi.localIP() : WiFi.softAPIP();
-  twai_status_info_t st; unsigned long tec = 0;
-  if (twai_get_status_info(&st) == ESP_OK) tec = st.tx_error_counter;
-  j += ",\"clock\":\"" + String(clk) + "\"";
-  j += ",\"synced\":"  + String(timeSynced ? "true" : "false");
-  j += ",\"wmode\":\"" + String(joined ? "join" : "ap") + "\"";
-  j += ",\"ip\":\""    + ip.toString() + "\"";
-  j += ",\"net\":"     + String((joined && timeSynced) ? "true" : "false");
-  j += ",\"sdtype\":\""+ String(storage ? (useSD ? "SD" : "Flash") : "-") + "\"";
-  j += ",\"sdtot\":"   + String((unsigned long)(storageTotalBytes() / (1024UL * 1024UL)));
-  j += ",\"sdfree\":"  + String((unsigned long)(cachedFreeBytes / (1024UL * 1024UL)));
-  j += ",\"rec\":"     + String(recording ? "true" : "false");
-  j += ",\"sess\":"    + String(sessionNum);
-  j += ",\"canlive\":" + String(rxCount > 0 ? "true" : "false");
-  j += ",\"canmode\":\""+ String(currentCanMode ? "Lauschen" : "Normal") + "\"";
-  j += ",\"canrx\":"   + String(rxCount);
-  j += ",\"cantec\":"  + String(tec);
-  j += ",\"fw\":\"OpenOBD v2\"";
-  j += "}";
-  server.send(200, "application/json", j);
-}
 
-// Live-CAN-Explorer: zeigt jede gesehene CAN-ID, Rate und letzte Bytes
-void handleExplore() {
-  String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>CAN Explorer</title></head>"
-    "<body style='font-family:monospace;padding:16px;background:#0f1020;color:#eee;'>"
-    "<h2 style='font-family:sans-serif;'>CAN Explorer <a href='/' style='font-size:0.6em;color:#8ad;'>&larr; Dashboard</a></h2>"
-    "<div id='meta' style='color:#aaa;margin-bottom:10px;'></div>"
-    "<table style='width:100%;border-collapse:collapse;font-size:0.9em;'>"
-    "<tr style='color:#aaa;text-align:left;border-bottom:1px solid #333;'>"
-    "<th>ID</th><th>Ext</th><th>Hz</th><th>Count</th><th>Letzte Bytes</th></tr>"
-    "<tbody id='rows'></tbody></table>"
-    "<script>"
-    "setInterval(()=>fetch('/api/frames').then(r=>r.json()).then(d=>{"
-      "document.getElementById('meta').textContent='Eindeutige IDs: '+d.ids.length+'  |  Frames gesamt: '+d.total;"
-      "d.ids.sort((a,b)=>parseInt(a.id,16)-parseInt(b.id,16));"
-      "document.getElementById('rows').innerHTML=d.ids.map(f=>"
-        "'<tr style=\"border-bottom:1px solid #1c1e30;\"><td style=\"color:#e9a844;\">0x'+f.id+"
-        "'</td><td>'+(f.ext?'Y':'')+'</td><td>'+f.hz+'</td><td>'+f.count+'</td>"
-        "<td style=\"color:#8ad;\">'+f.bytes+'</td></tr>').join('');"
-    "}).catch(()=>{}),500);"
-    "</script></body></html>";
-  server.send(200, "text/html", html);
-}
 
-void handleApiFrames() {
-  String j = "{\"total\":" + String(totalFramesSeen) + ",\"ids\":[";
-  unsigned long now = millis();
-  for (int i = 0; i < numFrames; i++) {
-    FrameInfo* f = &frames[i];
-    unsigned long span = now - f->firstMs; if (span < 1) span = 1;
-    float hz = f->count * 1000.0 / span;
-    char idhex[9]; snprintf(idhex, sizeof(idhex), "%03X", f->id);
-    char bytes[26]; int o = 0;
-    for (int b = 0; b < f->dlc && b < 8; b++) o += snprintf(bytes+o, sizeof(bytes)-o, "%02X ", f->data[b]);
-    if (i) j += ",";
-    j += "{\"id\":\"" + String(idhex) + "\",\"ext\":" + String(f->ext ? 1 : 0)
-       + ",\"hz\":" + String(hz,1) + ",\"count\":" + String(f->count)
-       + ",\"bytes\":\"" + String(bytes) + "\"}";
-  }
-  j += "]}";
-  server.send(200, "application/json", j);
-}
 
-void handleRecord() {
-  String cmd = server.hasArg("cmd") ? server.arg("cmd") : "";
-  if (cmd == "toggle") recording = !recording;
-  else if (cmd == "start") recording = true;
-  else if (cmd == "stop") recording = false;
-  else if (cmd == "new") newSessionRequested = true;   // ausgefuehrt von loop() — kein SD/rawBuf-Zugriff vom Web-Task
-  server.send(200, "application/json", String("{\"recording\":") + (recording ? "true" : "false") + "}");
-}
 
-// Pfad einer Session aus dem Index /sessions.csv holen (Dateien liegen in datierten Ordnern).
-// Erwartet, dass der Aufrufer fsMutex bereits haelt.
-bool sessionPath(int s, bool raw, char* out, size_t n) {
-  out[0] = 0;
-  if (!storage) return false;
-  File mf = storage->open("/sessions.csv", "r");
-  if (!mf) return false;
-  while (mf.available()) {
-    String line = mf.readStringUntil('\n');
-    int c1 = line.indexOf(','); if (c1 < 0) continue;
-    if (line.substring(0, c1).toInt() != s) continue;
-    int c2 = line.indexOf(',', c1 + 1); int c3 = line.indexOf(',', c2 + 1);
-    if (c2 < 0 || c3 < 0) break;
-    String p = raw ? line.substring(c3 + 1) : line.substring(c2 + 1, c3);
-    p.trim(); strlcpy(out, p.c_str(), n);
-    break;
-  }
-  mf.close();
-  return out[0] != 0;
-}
 
-void handleDownload() {  // ?s=N&raw=1
-  if (!storage) { server.send(503, "text/plain", "Kein Speicher verfuegbar"); return; }
-  int s = server.hasArg("s") ? server.arg("s").toInt() : sessionNum;
-  bool raw = server.hasArg("raw");
-  if (xSemaphoreTake(fsMutex, pdMS_TO_TICKS(1000))) {
-    char path[48];
-    if (!sessionPath(s, raw, path, sizeof(path))) { xSemaphoreGive(fsMutex); server.send(404, "text/plain", "Not found"); return; }
-    File f = storage->open(path, "r");
-    if (!f) { xSemaphoreGive(fsMutex); server.send(404, "text/plain", "Not found"); return; }
-    char fname[40]; snprintf(fname, sizeof(fname), "openobd_%ss%03d.csv", raw ? "raw_" : "", s);
-    server.sendHeader("Content-Disposition", String("attachment; filename=\"") + fname + "\"");
-    server.streamFile(f, "text/csv");
-    f.close();
-    xSemaphoreGive(fsMutex);
-  } else server.send(503, "text/plain", "Busy");
-}
 
-// Sessions-Liste aus dem Index (neueste zuerst, bis zu 40). Datei-Groessen live.
-void handleSessions() {
-  if (!storage) { server.send(503, "text/plain", "Kein Speicher verfuegbar"); return; }
-  String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-    "<body style='font-family:sans-serif;padding:20px;background:#0f1020;color:#eee;max-width:680px;margin:0 auto;'>"
-    "<h2 style='text-align:center;'>Sessions</h2>"
-    "<div style='text-align:center;margin-bottom:15px;'><a href='/' style='color:#8ad;'>Dashboard</a></div>"
-    "<table style='width:100%;border-collapse:collapse;'>"
-    "<tr style='border-bottom:1px solid #333;color:#aaa;text-align:left;'><th style='padding:8px;'>Session</th>"
-    "<th style='padding:8px;'>Datum</th><th style='padding:8px;text-align:right;'>Clean</th>"
-    "<th style='padding:8px;text-align:right;'>Raw</th><th style='padding:8px;text-align:right;'></th></tr>";
-  const int MAXR = 40;
-  String ring[MAXR]; int cnt = 0;
-  if (xSemaphoreTake(fsMutex, pdMS_TO_TICKS(1000))) {
-    File mf = storage->open("/sessions.csv", "r");
-    if (mf) { while (mf.available()) { String l = mf.readStringUntil('\n'); l.trim(); if (l.length()) { ring[cnt % MAXR] = l; cnt++; } } mf.close(); }
-    int shown = cnt < MAXR ? cnt : MAXR;
-    for (int i = 0; i < shown; i++) {
-      String l = ring[(cnt - 1 - i) % MAXR];          // neueste zuerst
-      int c1 = l.indexOf(','), c2 = l.indexOf(',', c1 + 1), c3 = l.indexOf(',', c2 + 1);
-      if (c1 < 0 || c2 < 0 || c3 < 0) continue;
-      int num = l.substring(0, c1).toInt();
-      long long ep = atoll(l.substring(c1 + 1, c2).c_str());
-      String dec = l.substring(c2 + 1, c3), rw = l.substring(c3 + 1);
-      char dstr[20] = "--";
-      if (ep > 0) { time_t t = (time_t)(ep / 1000) + (time_t)tzOffsetMin * 60; struct tm tv; gmtime_r(&t, &tv); strftime(dstr, sizeof(dstr), "%Y-%m-%d", &tv); }
-      size_t dz = 0, rz = 0;
-      File fd = storage->open(dec.c_str(), "r"); if (fd) { dz = fd.size(); fd.close(); }
-      File fr = storage->open(rw.c_str(), "r");  if (fr) { rz = fr.size(); fr.close(); }
-      bool active = (num == sessionNum);
-      html += "<tr style='border-bottom:1px solid #1c1e30;'><td style='padding:8px;'>" +
-              String(active ? "<b>s" : "s") + String(num) + String(active ? " (aktiv)</b>" : "") + "</td>"
-              "<td style='padding:8px;color:#aaa;'>" + String(dstr) + "</td>"
-              "<td style='padding:8px;text-align:right;'><a href='/download?s=" + String(num) + "' style='color:#8ad;'>" + String(dz / 1024) + " KB</a></td>"
-              "<td style='padding:8px;text-align:right;'><a href='/download?raw=1&s=" + String(num) + "' style='color:#e9a844;'>" + String(rz / 1024) + " KB</a></td>"
-              "<td style='padding:8px;text-align:right;'>" +
-              String(active ? "" : ("<a href='/delete?s=" + String(num) + "' onclick='return confirm(\"Session " + String(num) + " loeschen?\")' style='color:#DC3545;'>Del</a>")) +
-              "</td></tr>";
-    }
-    xSemaphoreGive(fsMutex);
-  }
-  html += "</table>";
-  if (cnt > MAXR) html += "<p style='color:#666;text-align:center;'>&hellip; nur die " + String(MAXR) + " neuesten von " + String(cnt) + " gezeigt</p>";
-  html += "</body></html>";
-  server.send(200, "text/html", html);
-}
 
-// Session loeschen (decoded + raw + anchor); aktive Session ist geschuetzt
-void handleDelete() {
-  if (!storage) { server.send(503, "text/plain", "Kein Speicher verfuegbar"); return; }
-  if (!server.hasArg("s")) { server.send(400, "text/plain", "?s=N fehlt"); return; }
-  int s = server.arg("s").toInt();
-  if (s == sessionNum) { server.send(400, "text/plain", "Aktive Session kann nicht geloescht werden"); return; }
-  if (xSemaphoreTake(fsMutex, pdMS_TO_TICKS(1000))) {
-    char dp[48], rp[48];
-    if (sessionPath(s, false, dp, sizeof(dp)) && storage->exists(dp)) {
-      storage->remove(dp);
-      String ap = String(dp); ap.replace(".csv", ".anchor");   // Anchor liegt neben der Clean-CSV
-      if (storage->exists(ap.c_str())) storage->remove(ap.c_str());
-    }
-    if (sessionPath(s, true, rp, sizeof(rp)) && storage->exists(rp)) storage->remove(rp);
-    // Index /sessions.csv ohne diese Session neu schreiben
-    File mf = storage->open("/sessions.csv", "r");
-    String keep = "";
-    if (mf) {
-      while (mf.available()) {
-        String l = mf.readStringUntil('\n'); if (l.length() < 2) continue;
-        int c1 = l.indexOf(','); if (c1 > 0 && l.substring(0, c1).toInt() == s) continue;
-        l.trim(); keep += l; keep += "\n";
-      }
-      mf.close();
-    }
-    File wf = storage->open("/sessions.csv", "w"); if (wf) { wf.print(keep); wf.close(); }
-    xSemaphoreGive(fsMutex);
-    server.sendHeader("Location", "/sessions");
-    server.send(302);
-  } else server.send(503, "text/plain", "Busy");
-}
 
-void handleLog() {
-  String out; out.reserve(LOG_LINES * LOG_LINE_LEN);
-  int total = logIndex < LOG_LINES ? logIndex : LOG_LINES;
-  int start = logIndex < LOG_LINES ? 0 : logIndex - LOG_LINES;
-  for (int i = start; i < start + total; i++) { out += logBuf[i % LOG_LINES]; out += '\n'; }
-  server.send(200, "text/plain", out);
-}
 
-void handleTimeouts() {
-  String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-    "<body style='font-family:sans-serif;padding:20px;background:#0f1020;color:#eee;max-width:640px;margin:0 auto;'>"
-    "<h2 style='text-align:center;'>PID-Status</h2>"
-    "<div style='text-align:center;margin-bottom:15px;'><a href='/' style='color:#8ad;'>Dashboard</a></div>"
-    "<table style='width:100%;border-collapse:collapse;'>"
-    "<tr style='border-bottom:1px solid #333;color:#aaa;text-align:left;'><th style='padding:8px;'>PID</th>"
-    "<th style='padding:8px;text-align:right;'>OK</th><th style='padding:8px;text-align:right;'>Timeouts</th>"
-    "<th style='padding:8px;text-align:right;'>Status</th></tr>";
-  for (int i = 0; i < numTrackedPids; i++) {
-    PidStats* s = &pidStats[i];
-    char pidHex[8]; snprintf(pidHex, sizeof(pidHex), "0x%02X", s->pid);
-    const char* st = s->disabled ? "<span style='color:#DC3545;'>Disabled</span>" : "<span style='color:#28a745;'>Active</span>";
-    html += "<tr style='border-bottom:1px solid #1c1e30;'><td style='padding:8px;'>" + String(pidHex) + "</td>"
-            "<td style='padding:8px;text-align:right;'>" + String(s->responses) + "</td>"
-            "<td style='padding:8px;text-align:right;'>" + String(s->timeouts) + "</td>"
-            "<td style='padding:8px;text-align:right;'>" + String(st) + "</td></tr>";
-  }
-  html += "</table></body></html>";
-  server.send(200, "text/html", html);
-}
 
-// Handy schickt beim Dashboard-Oeffnen Date.now() (ms) + Zeitzonen-Offset -> Anker setzen
-void handleSetTime() {
-  if (server.hasArg("epoch")) {
-    anchorEpochMs = atoll(server.arg("epoch").c_str());
-    anchorUptimeMs = millis();
-    tzOffsetMin = server.hasArg("tz") ? server.arg("tz").toInt() : 0;
-    bool first = !timeSynced; timeSynced = true;
-    writeTimeAnchor();
-    if (first) addLog("Zeit synchronisiert (Handy)");
-  }
-  char c[40]; clockString(c, sizeof(c));
-  server.send(200, "application/json", String("{\"synced\":") + (timeSynced ? "true" : "false") + ",\"clock\":\"" + c + "\"}");
-}
 
-static uint8_t bcd(int v) { return ((v / 10) << 4) | (v % 10); }
 
-// Time Hunt: gleicht die (per Handy bekannte) Echtzeit gegen alle CAN-Frames ab und
-// markiert Kandidaten, die die Fahrzeug-Uhr enthalten koennten (binaer + BCD).
-void handleTimeHunt() {
-  String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-    "<body style='font-family:monospace;padding:20px;background:#0f1020;color:#eee;'>"
-    "<h2 style='font-family:sans-serif;'>Time Hunt &mdash; CAN-Uhr-Suche <a href='/' style='font-size:0.6em;color:#8ad;'>Dashboard</a></h2>";
-  if (!timeSynced) {
-    html += "<p style='color:#e9a844;'>Zuerst das Dashboard oeffnen, damit die Handy-Zeit synct. Dann gleiche ich die "
-            "aktuelle Uhrzeit gegen alle CAN-Frames ab und markiere moegliche Uhr-Kandidaten.</p>";
-  } else {
-    struct tm t; localNow(t);
-    int hh=t.tm_hour, mm=t.tm_min, ss=t.tm_sec, dd=t.tm_mday, mo=t.tm_mon+1, y2=(t.tm_year+1900)%100;
-    char nb[40]; clockString(nb, sizeof(nb));
-    html += "<p style='color:#aaa;'>Referenz jetzt: <b>" + String(nb) + "</b>. Suche Bytes = HH:MM, MM:SS oder Tag/Monat/Jahr.</p>"
-            "<table style='width:100%;border-collapse:collapse;'><tr style='color:#aaa;text-align:left;border-bottom:1px solid #333;'>"
-            "<th>ID</th><th>Offset</th><th>Treffer</th><th>Bytes</th></tr>";
-    int hits = 0;
-    for (int i = 0; i < numFrames; i++) {
-      FrameInfo* f = &frames[i]; int d = f->dlc;
-      for (int o = 0; o < d; o++) {
-        const char* hit = nullptr;
-        if (o+1 < d && ((f->data[o]==hh && f->data[o+1]==mm) || (f->data[o]==bcd(hh) && f->data[o+1]==bcd(mm)))) hit = "HH:MM";
-        else if (o+2 < d && ((f->data[o]==dd && f->data[o+1]==mo && f->data[o+2]==y2) ||
-                             (f->data[o]==bcd(dd) && f->data[o+1]==bcd(mo) && f->data[o+2]==bcd(y2)))) hit = "Tag-Monat-Jahr";
-        else if (o+1 < d && ((f->data[o]==mm && f->data[o+1]==ss) || (f->data[o]==bcd(mm) && f->data[o+1]==bcd(ss)))) hit = "MM:SS";
-        if (hit) {
-          char idhex[8]; snprintf(idhex, sizeof(idhex), "%03X", f->id);
-          char bytes[26]; int bo=0; for (int b=0;b<d&&b<8;b++) bo+=snprintf(bytes+bo,sizeof(bytes)-bo,"%02X ",f->data[b]);
-          html += "<tr style='border-bottom:1px solid #1c1e30;'><td style='color:#e9a844;'>0x"+String(idhex)+
-                  "</td><td>"+String(o)+"</td><td style='color:#0f7;'>"+String(hit)+"</td><td style='color:#8ad;'>"+String(bytes)+"</td></tr>";
-          hits++;
-        }
-      }
-    }
-    html += "</table>";
-    if (!hits) html += "<p style='color:#e9a844;margin-top:12px;'>Noch kein Treffer. Motor an, ein paar Sekunden warten, F5. Kommt dauerhaft "
-                       "nichts, gibt der Golf seine Uhr am OBD-Port vermutlich nicht als Broadcast raus &mdash; dann bleibt der Handy-Sync die Quelle.</p>";
-    else html += "<p style='color:#666;font-size:0.85em;margin-top:12px;'>Heuristik &mdash; Treffer koennen Zufall sein. Sicher ist ein Kandidat, "
-                 "wenn er ueber die Zeit korrekt weitertickt (im CAN Explorer beobachten).</p>";
-  }
-  html += "</body></html>";
-  server.send(200, "text/html", html);
-}
 
-void handlePids() {
-  String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-    "<body style='font-family:sans-serif;padding:20px;background:#0f1020;color:#eee;max-width:640px;margin:0 auto;'>"
-    "<h2 style='text-align:center;'>PID-Discovery</h2>"
-    "<div style='text-align:center;margin-bottom:12px;'><a href='/' style='color:#8ad;'>Dashboard</a> &nbsp; "
-    "<button onclick=\"fetch('/api/rediscover').then(()=>{document.body.style.opacity=0.5;setTimeout(()=>location.reload(),6000)})\" "
-    "style='padding:6px 14px;border:0;border-radius:5px;background:#e9a844;color:#111;'>Discovery neu ausf&uuml;hren</button></div>";
-  if (!discoveryDone) {
-    html += "<p style='text-align:center;color:#e9a844;'>Noch keine Antwort vom Auto &mdash; es werden die bekannten Standard-PIDs gepollt (Fallback).</p>";
-  } else {
-    html += "<p style='text-align:center;color:#aaa;'>Dein Fahrzeug meldet <b style='color:#0f7;'>" + String(numSupported) +
-            "</b> unterstuetzte Standard-PIDs.</p>"
-            "<table style='width:100%;border-collapse:collapse;font-family:monospace;'>"
-            "<tr style='color:#aaa;text-align:left;border-bottom:1px solid #333;'><th style='padding:6px;'>PID</th><th style='padding:6px;'>Status</th></tr>";
-    for (int p = 1; p < 256; p++) {
-      if (!pidSupported[p]) continue;
-      const char* tag = canDecode((uint8_t)p)
-        ? "<span style='color:#0f7;'>dekodiert</span>"
-        : "<span style='color:#e9a844;'>roh (noch nicht dekodiert)</span>";
-      char hx[8]; snprintf(hx, sizeof(hx), "0x%02X", p);
-      html += "<tr style='border-bottom:1px solid #1c1e30;'><td style='padding:6px;color:#8ad;'>" +
-              String(hx) + "</td><td style='padding:6px;'>" + String(tag) + "</td></tr>";
-    }
-    html += "</table><p style='color:#666;font-size:0.85em;margin-top:14px;'>Gelb = das Auto liefert diesen Wert, "
-            "OpenOBD uebersetzt ihn nur noch nicht in Klartext. Kommt in einer spaeteren Phase.</p>";
-  }
-  html += "</body></html>";
-  server.send(200, "text/html", html);
-}
 
-void handleRediscover() {
-  rediscoverRequested = true;   // loop() fuehrt die Discovery aus (blockiert Polling kurz)
-  server.send(200, "application/json", "{\"ok\":true}");
-}
 
-// Auto-Probe: alle plausiblen CAN-Konfigurationen in einem Rutsch durchtesten.
-// Sucht die Kombination, bei der der Golf tatsaechlich antwortet — damit man
-// nicht fuer jede Hypothese einzeln zum Auto laufen muss. Laeuft in loop() (Core 1).
-void runAutoProbe() {
-  static const int    rates[]  = { 500, 250 };
-  static const uint32_t reqIds[] = { 0x7DF, 0x7E0, 0x18DB33F1 };  // funktional, physisch, 29-bit
-  static const uint8_t  pads[]   = { 0x00, 0x55 };
-  int n = 0;
-  n += snprintf(probeReport+n, sizeof(probeReport)-n, "Auto-Probe laeuft...\n");
-  int savedRate = canBitrateK; uint32_t savedId = obdReqId; uint8_t savedPad = obdPad;
-  bool win = false;
 
-  for (int ri = 0; ri < 2 && !win; ri++) {
-    canBitrateK = rates[ri];
-    reinitCan(0);
-    delay(150);
-    // passiver Bus-Verkehr auf dieser Bitrate? (starker Hinweis auf richtige Rate)
-    unsigned long t0 = millis(); int seen = 0; twai_message_t rx;
-    while (millis() - t0 < 400) if (twai_receive(&rx, pdMS_TO_TICKS(20)) == ESP_OK) { captureFrame(rx); seen++; }
-    n += snprintf(probeReport+n, sizeof(probeReport)-n, "\n[%dk] passiv gesehen: %d Frames\n", rates[ri], seen);
 
-    for (int ii = 0; ii < 3 && !win; ii++) {
-      for (int pi = 0; pi < 2 && !win; pi++) {
-        obdReqId = reqIds[ii]; obdPad = pads[pi];
-        bool ok = probeSupportedPids();   // nutzt reqId/pad/extd automatisch
-        if (ok) {
-          n += snprintf(probeReport+n, sizeof(probeReport)-n,
-                        "  ID 0x%-8X Pad 0x%02X -> ANTWORT! (%d PIDs)\n", reqIds[ii], pads[pi], numSupported);
-          win = true;
-        } else {
-          n += snprintf(probeReport+n, sizeof(probeReport)-n,
-                        "  ID 0x%-8X Pad 0x%02X -> still\n", reqIds[ii], pads[pi]);
-        }
-      }
-    }
-  }
 
-  if (win) {
-    n += snprintf(probeReport+n, sizeof(probeReport)-n,
-                  "\nGEFUNDEN: %dk, ID 0x%X, Pad 0x%02X, %d PIDs. Uebernommen.\n",
-                  canBitrateK, obdReqId, obdPad, numSupported);
-    discoveryDone = true;
-    resetPidStats();   // vorher (unter 0x7DF) deaktivierte PIDs wieder freigeben -> echtes Polling
-    writePidsFile();
-  } else {
-    canBitrateK = savedRate; obdReqId = savedId; obdPad = savedPad;
-    n += snprintf(probeReport+n, sizeof(probeReport)-n,
-                  "\nKEINE Kombination lieferte eine Antwort.\n"
-                  "-> Motor lief? Stecker fest? Dann evtl. Gateway sperrt OBD.\n");
-  }
-  reinitCan(0);   // mit finaler (Gewinner- oder zurueckgesetzter) Konfig neu starten
-}
-
-void handleProbe() {
-  probeRequested = true;   // loop() fuehrt aus (blockiert ~10-20s)
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleProbeReport() { server.send(200, "text/plain", probeReport); }
-
-void handleCanMode() {  // ?m=normal|listen, ohne Arg: umschalten — ausgefuehrt von loop()
-  String m = server.hasArg("m") ? server.arg("m") : "toggle";
-  if (m == "listen") requestedCanMode = 1;
-  else if (m == "normal") requestedCanMode = 0;
-  else requestedCanMode = (currentCanMode == 0) ? 1 : 0;
-  server.send(200, "application/json", "{\"ok\":true}");
-}
 
 // ---------- PID-Discovery ----------
 void captureFrame(twai_message_t &rx);   // vorwaerts deklariert — Discovery schneidet auch mit
@@ -1387,153 +750,164 @@ void testUdsConnection() {
   addLog("%s", udsTestResult);
 }
 
-// ================= Hoeflicher UDS-Scan ("nur lesen, was das Auto freiwillig gibt") =========
-// Sendet AUSSCHLIESSLICH Leseanfragen (Service 0x22) in der Standard-Sitzung. Wird eine DID
-// abgelehnt (NRC) -> wird das akzeptiert, wir gehen weiter. KEINE Sitzungssteuerung (0x10),
-// KEIN Security-Access (0x27), KEIN Schreiben (0x2E/0x31). Standard-Identifikations-DIDs
-// benennen die Steuergeraete selbst, statt zu raten. Nur per Knopf (kurzes Blocking, wie Probe).
-struct PoliteTarget { uint8_t ecu; uint16_t did; const char* name; };
-const PoliteTarget politeList[] = {
-  { 0x01, 0xF197, "Motor 0x01 Systemname" }, { 0x01, 0xF187, "Motor 0x01 Teilenummer" },
-  { 0x01, 0xF189, "Motor 0x01 SW-Version" }, { 0x01, 0xF190, "Motor 0x01 VIN" },
-  { 0x02, 0xF197, "STG 0x02 Systemname" },   { 0x02, 0xF187, "STG 0x02 Teilenummer" },
-  { 0x02, 0xF189, "STG 0x02 SW-Version" },
-  { 0x10, 0xF197, "STG 0x10 Systemname" },   { 0x10, 0xF187, "STG 0x10 Teilenummer" },
-  { 0x10, 0xF189, "STG 0x10 SW-Version" },
-};
-const int NUM_POLITE = sizeof(politeList) / sizeof(politeList[0]);
-char politeReport[1500] = "Noch kein hoeflicher Scan gelaufen. Am Auto (Zuendung an): Knopf druecken.";
-volatile bool politeScanRequested = false;
 
-void runPoliteScan() {
-  int n = 0;
-  n += snprintf(politeReport + n, sizeof(politeReport) - n,
-                "Hoeflicher UDS-Scan (nur Lesen 0x22, Standard-Sitzung):\n\n");
-  for (int i = 0; i < NUM_POLITE && n < (int)sizeof(politeReport) - 90; i++) {
-    uint8_t ecu = politeList[i].ecu; uint16_t did = politeList[i].did;
-    twai_message_t rx;
-    while (twai_receive(&rx, 0) == ESP_OK) captureFrame(rx);   // Queue leeren, nichts verlieren
-    char res[80]; strcpy(res, "keine Antwort");
-    if (requestUdsData(ecu, did)) {
-      uint32_t rsp = UDS_RSP(ecu);
-      unsigned long t0 = millis();
-      while (millis() - t0 < 300) {
-        if (twai_receive(&rx, pdMS_TO_TICKS(20)) != ESP_OK) continue;
-        captureFrame(rx);
-        if (rx.identifier != rsp) continue;
-        uint8_t pci = rx.data[0] & 0xF0;
-        if (pci == 0x00 && rx.data[1] == 0x62) {              // Single-Frame-Positivantwort
-          uint8_t len = rx.data[0] & 0x0F;
-          char hex[26] = "", asc[12] = ""; int ho = 0, ao = 0;
-          for (int b = 4; b < 1 + len && b < 8; b++) {        // Datenbytes nach '62 DIDhi DIDlo'
-            ho += snprintf(hex + ho, sizeof(hex) - ho, "%02X", rx.data[b]);
-            char c = (char)rx.data[b]; if (ao < 11) asc[ao++] = (c >= 32 && c < 127) ? c : '.';
-          }
-          asc[ao] = 0;
-          snprintf(res, sizeof(res), "OK  %s  \"%s\"", hex, asc);
-          break;
-        } else if (pci == 0x10 && rx.data[2] == 0x62) {       // First Frame -> lange Antwort
-          snprintf(res, sizeof(res), "existiert (mehrteilig >7B, Flow-Control folgt spaeter)");
-          break;
-        } else if (rx.data[1] == 0x7F) {                      // Ablehnung -> hoeflich akzeptieren
-          snprintf(res, sizeof(res), "abgelehnt (NRC 0x%02X) - ok, weiter", rx.data[3]);
-          break;
-        }
-      }
-    } else strcpy(res, "Senden fehlgeschlagen");
-    n += snprintf(politeReport + n, sizeof(politeReport) - n, "%-24s: %s\n", politeList[i].name, res);
-    delay(60);   // hoeflich: den Bus nicht fluten
-  }
-  // Bericht auf SD sichern (einmalig, unter Mutex)
-  if (storage && xSemaphoreTake(fsMutex, pdMS_TO_TICKS(300))) {
-    File f = storage->open("/uds_scan.txt", "w");
-    if (f) { f.print(politeReport); f.close(); }
-    xSemaphoreGive(fsMutex);
-  }
-  addLog("Hoeflicher UDS-Scan fertig");
+
+
+// ---------- Zeit: POSIX-Zone setzen (autom. Sommer-/Winterzeit) ----------
+void applyTz() { setenv("TZ", cfg.tz, 1); tzset(); }
+
+void setTimeAnchor(long long epochMs) {   // Anker: UTC-Epoche <-> Uptime; Lokalzeit macht localtime_r (DST)
+  anchorEpochMs = epochMs; anchorUptimeMs = millis(); timeSynced = true;
+  writeTimeAnchor();
 }
 
-void handlePoliteScan() { politeScanRequested = true; server.send(200, "application/json", "{\"ok\":true}"); }
-
-void handleUdsTest() { udsTestRequested = true; server.send(200, "application/json", "{\"ok\":true}"); }
-
-void handleUds() {
-  String h = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-    "<body style='font-family:sans-serif;padding:18px;background:#0f1020;color:#eef;'>"
-    "<h2>UDS &mdash; Phase 2 <a href='/' style='font-size:.6em;color:#8ad;'>Dashboard</a></h2>"
-    "<p style='color:#aaa;'>Aktive VAG-Diagnose (Service 0x22, 29-bit). Poller: <b style='color:" +
-    String(udsPollEnabled ? "#0f7'>AN" : "#e94'>AUS") + "</b></p>"
-    "<button onclick=\"fetch('/api/udstest');this.textContent='teste...';setTimeout(()=>location.reload(),1600)\" "
-    "style='padding:12px 20px;border:0;border-radius:10px;background:#e9a844;color:#111;font-weight:bold;'>UDS-Test DSG (0x18DA10F1)</button>"
-    "<p style='color:#0f7;font-weight:bold;'>" + String(udsTestResult) + "</p>"
-    "<hr style='border-color:#222;margin:14px 0;'>"
-    "<h3 style='margin:0 0 4px;'>Hoeflicher Scan</h3>"
-    "<p style='color:#aaa;font-size:.9em;margin:0 0 8px;'>Liest nur (Service 0x22) und benennt die "
-    "Steuergeraete selbst. Abgelehnte DIDs werden akzeptiert &mdash; kein Zwang, keine Sitzung, "
-    "kein Schreiben. Ergebnis auch als <code>/uds_scan.txt</code> auf der SD.</p>"
-    "<button onclick=\"fetch('/api/politescan');this.textContent='scanne ~4s...';setTimeout(()=>location.reload(),4500)\" "
-    "style='padding:12px 20px;border:0;border-radius:10px;background:#37c98a;color:#04120c;font-weight:bold;'>Hoeflichen Scan starten</button>"
-    "<pre style='background:#0b111d;border:1px solid #1d2635;border-radius:10px;padding:12px;overflow:auto;white-space:pre-wrap;'>" + String(politeReport) + "</pre>"
-    "<table style='width:100%;border-collapse:collapse;font-family:monospace;margin-top:8px;'>"
-    "<tr style='color:#aaa;text-align:left;border-bottom:1px solid #333;'><th>STG</th><th>DID</th><th>Name</th><th>Wert</th></tr>";
-  for (int i = 0; i < NUM_UDS; i++) {
-    UdsItem &it = udsTable[i]; char b[120];
-    snprintf(b, sizeof(b), "<tr style='border-bottom:1px solid #1c1e30;'><td>0x%02X</td><td style='color:#e9a844'>0x%04X</td>"
-             "<td>%s</td><td style='color:#8ad'>%s %s</td></tr>",
-             it.ecu, it.did, it.name, it.seen ? String(it.value).c_str() : "--", it.unit);
-    h += b;
-  }
-  h += "</table><p style='color:#666;font-size:.85em;margin-top:12px;'>Gefundene DIDs in <code>udsTable[]</code> "
-       "eintragen, dann <code>udsPollEnabled=true</code>. Multiframe-Antworten (&gt;7 Byte) folgen in einer spaeteren Phase.</p>"
-       "</body></html>";
-  server.send(200, "text/html", h);
+// struct tm (UTC) -> Unix-Sekunden, ohne libc-Zeitzone (fuer den HTTP-Date-Header)
+static long long tmToEpoch(struct tm* t) {
+  static const int cum[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+  long y = t->tm_year + 1900;
+  long days = (y-1970)*365 + (y-1969)/4 - (y-1901)/100 + (y-1601)/400 + cum[t->tm_mon] + (t->tm_mday-1);
+  if (t->tm_mon >= 2 && ((y%4==0 && y%100!=0) || y%400==0)) days += 1;
+  return (long long)days*86400 + t->tm_hour*3600 + t->tm_min*60 + t->tm_sec;
 }
 
-// ---------- Zeit per NTP (nur wenn wir Internet ueber das Auto-WLAN haben) ----------
-// Setzt denselben Anker wie der Handy-Sync (UTC-Epoche <-> Uptime); der lokale
-// Offset wird erst in localNow() gewendet. -> Keine Uhr-Hardware noetig.
-void syncTimeNtp() {
-  configTime(0, 0, cfg.ntp);   // UTC holen
+// NTP (UDP) — mehrere Server, falls einer nicht antwortet.
+bool tryNtp() {
+  configTzTime(cfg.tz, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
   struct tm ti;
-  if (getLocalTime(&ti, 5000)) {
-    anchorEpochMs  = (long long)time(nullptr) * 1000LL;
-    anchorUptimeMs = millis();
-    tzOffsetMin    = cfg.tzMin;
-    timeSynced     = true;
-    writeTimeAnchor();
-    addLog("Zeit per NTP gesetzt (%s)", cfg.ntp);
-  } else {
-    addLog("NTP-Sync fehlgeschlagen (kein Internet im WLAN?)");
-  }
+  if (getLocalTime(&ti, 8000)) { setTimeAnchor((long long)time(nullptr)*1000LL); addLog("Zeit per NTP"); return true; }
+  return false;
 }
 
-// ---------- WLAN: entweder ins Auto-WLAN einwaehlen (Internet + NTP + Handy behaelt
-//            Netz) oder eigenen Hotspot aufmachen. Bei Join-Fehler: Fallback-AP. ----------
-void setupWifi() {
-  bool joined = false;
-  if (strcmp(cfg.wifiMode, "join") == 0 && cfg.ssid[0]) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(cfg.ssid, cfg.pass);
-    addLog("WLAN: verbinde mit '%s' ...", cfg.ssid);
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 9000) delay(200);
-    joined = (WiFi.status() == WL_CONNECTED);
-    if (joined) { addLog("WLAN verbunden, IP: %s", WiFi.localIP().toString().c_str()); syncTimeNtp(); }
-    else        { addLog("WLAN-Beitritt fehlgeschlagen"); }
+// HTTP-Date-Fallback: viele Auto-/Mobilfunk-Hotspots blocken NTP (UDP 123), lassen aber HTTP
+// durch (z.B. Internetradio). Dann holen wir die Uhrzeit aus dem HTTP-'Date'-Header (TCP).
+bool tryHttpTime() {
+  WiFiClient c; c.setTimeout(4000);
+  if (!c.connect("google.com", 80)) return false;
+  c.print("HEAD / HTTP/1.1\r\nHost: google.com\r\nConnection: close\r\n\r\n");
+  unsigned long t0 = millis(); bool ok = false;
+  while (c.connected() && millis() - t0 < 4000) {
+    String line = c.readStringUntil('\n');
+    if (line.startsWith("Date:") || line.startsWith("date:")) {
+      struct tm tm = {};
+      if (strptime(line.c_str() + 6, "%a, %d %b %Y %H:%M:%S", &tm)) {
+        setTimeAnchor(tmToEpoch(&tm) * 1000LL); addLog("Zeit per HTTP-Date"); ok = true;
+      }
+      break;
+    }
+    if (line == "\r" || line.length() == 0) break;   // Header-Ende
   }
-  if (!joined) {
-    if (strcmp(cfg.wifiMode, "join") == 0 && !cfg.fallbackAp) {
-      addLog("WLAN: join gescheitert, kein Fallback -> offline");
-    } else {
-      WiFi.mode(WIFI_AP);
-      WiFi.softAP(cfg.apSsid, cfg.apPass);
-      addLog("WLAN AP '%s', IP: %s", cfg.apSsid, WiFi.softAPIP().toString().c_str());
+  c.stop();
+  return ok;
+}
+
+// ---------- WLAN: NUR kurz beim Boot fuer die NTP-Zeit, danach AUS ----------
+// Kein Webserver, kein AP mehr -> WLAN nur, wenn ein Auto-WLAN konfiguriert ist ("join").
+// Danach schalten wir WLAN ab, damit nur BLE laeuft (kein Funk-Konflikt, minimale Last).
+void setupWifi() {
+  if (strcmp(cfg.wifiMode, "join") == 0) {
+    struct { const char* s; const char* p; } nets[] = {
+      { CFG_WIFI_1_SSID, CFG_WIFI_1_PASS }, { CFG_WIFI_2_SSID, CFG_WIFI_2_PASS },
+      { CFG_WIFI_3_SSID, CFG_WIFI_3_PASS }, { CFG_WIFI_4_SSID, CFG_WIFI_4_PASS },
+    };
+    WiFi.mode(WIFI_STA);
+    // Netze der Reihe nach: verbinden -> Zeit holen (NTP, sonst HTTP-Date). Klappt Zeit -> fertig,
+    // sonst naechstes Netz. So faengt ein Netz ohne NTP nicht die ganze Zeitquelle ab.
+    for (auto& net : nets) {
+      if (!net.s[0]) continue;
+      addLog("WLAN: verbinde mit '%s' ...", net.s);
+      WiFi.begin(net.s, net.p);
+      unsigned long t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 9000) delay(200);
+      if (WiFi.status() != WL_CONNECTED) { addLog("  nicht verbunden -> naechstes"); continue; }
+      addLog("  verbunden (%s), hole Zeit ...", WiFi.localIP().toString().c_str());
+      if (tryNtp() || tryHttpTime()) break;    // Zeit da -> fertig
+      addLog("  Zeit ueber dieses Netz nicht moeglich -> naechstes");
+      WiFi.disconnect(true);
     }
   }
-  if (MDNS.begin("openobd")) { MDNS.addService("http", "tcp", 80); addLog("mDNS: http://openobd.local"); }
+  // WLAN nur anlassen, wenn Dev-Streaming (TCP/MQTT) es braucht — sonst aus (nur BLE, minimale Last)
+  if (cfg.streamTcp || cfg.mqttEn) {
+    addLog("WLAN bleibt an (Dev-Streaming)");
+  } else {
+    WiFi.disconnect(true, true); WiFi.mode(WIFI_OFF);
+    addLog("WLAN aus -> nur noch BLE");
+  }
 }
 
 // (Config kommt aus include/config.h zur Compile-Zeit — kein Laden von SD noetig.)
+
+// ================= BLE-Broadcast (statt Webserver) =================
+// Sendet Status + Werte als lesbare ASCII-Charakteristiken. Eine BLE-Scanner-App
+// (nRF Connect, Bluetooth Inspector) verbindet sich und sieht die Werte live.
+// Best-effort & entkoppelt: faellt BLE aus, laeuft das SD-Logging unberuehrt weiter.
+static NimBLECharacteristic *chStatus = nullptr, *chSystem = nullptr, *chTrip = nullptr, *chPids = nullptr, *chConn = nullptr;
+uint32_t bleHeartbeat = 0;
+char pidsStr[220] = "discovery laeuft...";   // Liste der erkannten PIDs (nach Discovery gefuellt)
+
+static void bleName(NimBLECharacteristic* c, const char* name) {
+  NimBLEDescriptor* d = c->createDescriptor("2901", NIMBLE_PROPERTY::READ, 24);
+  if (d) d->setValue(name);
+}
+
+void bleInit() {
+  NimBLEDevice::init("OpenOBD");
+  NimBLEServer* srv = NimBLEDevice::createServer();
+  NimBLEService* svc = srv->createService("6f70656e-6f62-6400-0000-0000000000ff");
+  chStatus = svc->createCharacteristic("6f70656e-6f62-6400-0000-000000000001", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  chSystem = svc->createCharacteristic("6f70656e-6f62-6400-0000-000000000002", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  chTrip   = svc->createCharacteristic("6f70656e-6f62-6400-0000-000000000003", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  chPids   = svc->createCharacteristic("6f70656e-6f62-6400-0000-000000000004", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  chConn   = svc->createCharacteristic("6f70656e-6f62-6400-0000-000000000005", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  bleName(chStatus, "Status");
+  bleName(chSystem, "System");
+  bleName(chTrip, "Trip");
+  bleName(chPids, "PIDs");
+  bleName(chConn, "Verbindung");
+  chStatus->setValue("start"); chSystem->setValue("--"); chTrip->setValue("--");
+  chPids->setValue(pidsStr); chConn->setValue("--");
+  svc->start();
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(svc->getUUID());
+  adv->setScanResponse(true);
+  NimBLEDevice::startAdvertising();
+  addLog("BLE aktiv: 'OpenOBD' (mit Scanner-App verbinden)");
+}
+
+// 1x/Sekunde aus loop(): Status + Werte als ASCII aktualisieren + notifizieren
+void bleUpdate() {
+  if (!chStatus) return;
+  char clk[40]; clockString(clk, sizeof(clk));
+  const char* tstr = timeSynced ? (strchr(clk, ' ') ? strchr(clk, ' ') + 1 : clk) : "unsync";
+  char b[80];
+  // Status: Herzschlag (zaehlt hoch = lebt), Uptime, freier RAM, verworfene Roh-Zeilen (Last-Indikator)
+  snprintf(b, sizeof(b), "HB%lu UP%lus HEAP%uk DROP%lu",
+           (unsigned long)(++bleHeartbeat), millis() / 1000,
+           (unsigned)(ESP.getFreeHeap() / 1024), rawLinesDropped);
+  chStatus->setValue((uint8_t*)b, strlen(b)); chStatus->notify();
+  // System: SD-frei, Aufnahme, Session, Uhrzeit (oder 'unsync' = kein NTP/Sync)
+  snprintf(b, sizeof(b), "SD%luMB REC%d S%d T:%s",
+           (unsigned long)(cachedFreeBytes / (1024UL * 1024UL)), recording ? 1 : 0, sessionNum, tstr);
+  chSystem->setValue((uint8_t*)b, strlen(b)); chSystem->notify();
+  // Trip: verstrichene km + Liter dieser Session + Momentanverbrauch (L/100 wenn faehrt)
+  double now100 = (speed_kmh > 3 && pidSeen[0x5E]) ? (fuel_rate / speed_kmh * 100.0) : 0.0;
+  snprintf(b, sizeof(b), "KM%.1f L%.2f NOW%.1f", totalDistKm, totalFuelL, now100);
+  chTrip->setValue((uint8_t*)b, strlen(b)); chTrip->notify();
+  // Verbindung: bekommt das Geraet Daten vom Auto? (rxCount>0 = Bus lebt / Auto antwortet)
+  twai_status_info_t st; unsigned long tec = 0;
+  if (twai_get_status_info(&st) == ESP_OK) tec = st.tx_error_counter;
+  snprintf(b, sizeof(b), "%s RX%lu TEC%lu %s", rxCount > 0 ? "verbunden" : "kein Bus",
+           rxCount, tec, discoveryDone ? "DISC-OK" : "DISC-?");
+  chConn->setValue((uint8_t*)b, strlen(b)); chConn->notify();
+}
+
+// ---------- Software-Watchdog: rebootet automatisch, falls loop() je haengt ----------
+// Laeuft auf Core 0 (loop() auf Core 1) -> greift auch, wenn Core 1 blockiert.
+void wdtTask(void* pv) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    if (lastLoopTick != 0 && (uint32_t)(millis() - lastLoopTick) > 15000) esp_restart();
+  }
+}
 
 // ---------- Setup ----------
 void setup() {
@@ -1545,6 +919,7 @@ void setup() {
   delay(10);
 
   fsMutex = xSemaphoreCreateMutex();
+  applyTz();          // Zeitzone (inkl. DST) fuer localtime_r setzen
 
   SPI.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   if (SD.begin(SD_CS_PIN)) {
@@ -1573,29 +948,8 @@ void setup() {
   recording = cfg.autoRecord;
   checkFreeSpace();   // Startwert fuer freien Speicher (danach alle 10s in loop)
 
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/data", HTTP_GET, handleData);
-  server.on("/explore", HTTP_GET, handleExplore);
-  server.on("/api/frames", HTTP_GET, handleApiFrames);
-  server.on("/api/record", HTTP_GET, handleRecord);
-  server.on("/download", HTTP_GET, handleDownload);
-  server.on("/sessions", HTTP_GET, handleSessions);
-  server.on("/log", HTTP_GET, handleLog);
-  server.on("/timeouts", HTTP_GET, handleTimeouts);
-  server.on("/pids", HTTP_GET, handlePids);
-  server.on("/api/settime", HTTP_GET, handleSetTime);
-  server.on("/timehunt", HTTP_GET, handleTimeHunt);
-  server.on("/delete", HTTP_GET, handleDelete);
-  server.on("/api/rediscover", HTTP_GET, handleRediscover);
-  server.on("/api/canmode", HTTP_GET, handleCanMode);
-  server.on("/api/probe", HTTP_GET, handleProbe);
-  server.on("/probereport", HTTP_GET, handleProbeReport);
-  server.on("/uds", HTTP_GET, handleUds);
-  server.on("/api/udstest", HTTP_GET, handleUdsTest);
-  server.on("/api/politescan", HTTP_GET, handlePoliteScan);
-  server.begin();
-
-  xTaskCreatePinnedToCore(webServerTask, "WebServer", 8192, NULL, 1, NULL, 0);
+  bleInit();          // BLE-Broadcast (Status + Werte) statt Webserver
+  xTaskCreatePinnedToCore(wdtTask, "WDT", 2048, NULL, 3, NULL, 0);   // Software-Watchdog (Core 0)
 
   if (cfg.streamTcp || cfg.mqttEn) {   // Dev-Streaming nur bei Bedarf hochfahren
     streamQ = xQueueCreate(256, sizeof(StreamFrame));
@@ -1617,7 +971,14 @@ void setup() {
 
   delay(200);                 // Bus kurz atmen lassen
   if (cfg.discovery) discoverSupportedPids();  // fragt das Auto, welche PIDs es unterstuetzt
+  { // erkannte PIDs fuer die BLE-Charakteristik zusammenbauen
+    int o = snprintf(pidsStr, sizeof(pidsStr), "%d PIDs:", numSupported);
+    for (int p = 1; p < 256 && o < (int)sizeof(pidsStr) - 4; p++)
+      if (pidSupported[p]) o += snprintf(pidsStr + o, sizeof(pidsStr) - o, " %02X", p);
+    if (chPids) chPids->setValue(pidsStr);
+  }
   testUdsConnection();        // Phase 2: einmalig pruefen, ob das DSG UDS spricht
+  lastLoopTick = millis();    // Software-Watchdog jetzt scharf schalten (Boot ist durch)
 }
 
 uint8_t getNextPid() {
@@ -1716,42 +1077,10 @@ void captureFrame(twai_message_t &rx) {
 }
 
 void loop() {
-  // 0) Vom Webserver angeforderte Aktionen hier ausfuehren — nur loop() darf
-  //    rawBuf und Session-Dateien anfassen (Race-Fix, s. Kopfkommentar)
-  if (newSessionRequested) {
-    newSessionRequested = false;
-    flushRaw(); openNewSession(); recording = true;
-  }
-  if (rediscoverRequested) {
-    rediscoverRequested = false;
-    discoverSupportedPids();   // blockiert das Polling wenige Sekunden — bewusst
-  }
-  if (probeRequested) {
-    probeRequested = false;
-    runAutoProbe();            // testet alle Bitraten/Adressen/Paddings (~10-20s)
-    requestPending = false; txBackoffUntil = 0;
-  }
-  if (udsTestRequested) {
-    udsTestRequested = false;
-    testUdsConnection();       // Phase 2: UDS-Verbindungstest (kurzes Blocking, wie Discovery)
-    requestPending = false; txBackoffUntil = 0;
-  }
-  if (politeScanRequested) {
-    politeScanRequested = false;
-    runPoliteScan();           // hoeflicher Lese-Scan (kurzes Blocking, nur 0x22)
-    requestPending = false; txBackoffUntil = 0;
-  }
-  if (requestedCanMode >= 0) {
-    int m = requestedCanMode; requestedCanMode = -1;
-    if (m != currentCanMode) {
-      twai_stop(); twai_driver_uninstall();
-      initCan(m);
-      requestPending = false; txBackoffUntil = 0;
-    }
-  }
+  lastLoopTick = millis();   // Software-Watchdog fuettern (haengt loop() je -> Auto-Reboot)
 
   // 1) Naechste Anfrage senden, falls keine offen (nicht im Lausch-Modus)
-  if (currentCanMode == 0 && !requestPending && millis() >= txBackoffUntil) sendObd2Request(getNextPid());
+  if (currentCanMode == 0 && !requestPending && (int32_t)(millis() - txBackoffUntil) >= 0) sendObd2Request(getNextPid());
   serviceUds();   // Phase 2: UDS-Abfrage einschieben (nur wenn aktiviert + OBD-Slot frei)
 
   // 2) Timeout der offenen Anfrage
@@ -1781,6 +1110,10 @@ void loop() {
       if (requestPending && rx.data[2] == pendingPid) requestPending = false;
     }
   }
+
+  // BLE-Broadcast 1x/s (Herzschlag + Status + Werte)
+  static unsigned long lastBle = 0;
+  if (millis() - lastBle >= 1000) { lastBle = millis(); bleUpdate(); }
 
   // 4) Alle LOG_INTERVAL_MS: Decoded-CSV schreiben + Roh-Puffer flushen + Status
   if (millis() - lastLog >= (unsigned long)cfg.logIntervalMs) {
